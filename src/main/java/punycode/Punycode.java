@@ -1,5 +1,7 @@
 package punycode;
 
+import java.util.function.Function;
+
 /**
  * Punycode（RFC 3492）编解码。
  *
@@ -102,7 +104,85 @@ public final class Punycode {
      * @throws PunycodeException 非法输入，或解码过程中发生 int 溢出
      */
     public static String decode(String input) {
-        throw new UnsupportedOperationException("not implemented");
+        int lastDash = input.lastIndexOf(DELIMITER);
+        String basic;
+        String encoded;
+        if (lastDash < 0) {
+            for (int i = 0; i < input.length(); i++) {
+                if (input.charAt(i) >= 0x80) {
+                    throw new PunycodeException("non-basic input without delimiter");
+                }
+            }
+            basic = "";
+            encoded = input;
+        } else {
+            if (lastDash == 0) {
+                throw new PunycodeException("empty basic section before delimiter");
+            }
+            basic = input.substring(0, lastDash);
+            for (int i = 0; i < basic.length(); i++) {
+                if (basic.charAt(i) >= 0x80) {
+                    throw new PunycodeException("non-basic code point in basic section");
+                }
+            }
+            encoded = input.substring(lastDash + 1);
+        }
+
+        int[] codePoints = new int[Math.max(1, input.length())];
+        int outLen = 0;
+        for (int i = 0; i < basic.length(); i++) {
+            codePoints[outLen++] = basic.charAt(i);
+        }
+
+        int n = INITIAL_N;
+        int bias = INITIAL_BIAS;
+        int i = 0;
+        int pos = 0;
+        while (pos < encoded.length()) {
+            int oldi = i;
+            int w = 1;
+            for (int k = BASE; ; k += BASE) {
+                if (pos >= encoded.length()) {
+                    throw new PunycodeException("truncated encoded section");
+                }
+                int digit = decodeDigit(encoded.charAt(pos++));
+                if ((long) digit * w > Integer.MAX_VALUE - i) {
+                    throw new PunycodeException("overflow");
+                }
+                i += digit * w;
+                int t = k - bias;
+                if (t < TMIN) {
+                    t = TMIN;
+                } else if (t > TMAX) {
+                    t = TMAX;
+                }
+                if (digit < t) {
+                    break;
+                }
+                if (w > Integer.MAX_VALUE / (BASE - TMIN)) {
+                    throw new PunycodeException("overflow");
+                }
+                w *= BASE - TMIN;
+            }
+            int outPlusOne = outLen + 1;
+            bias = adapt(i - oldi, outPlusOne, oldi == 0);
+            if (i / outPlusOne > Integer.MAX_VALUE - n) {
+                throw new PunycodeException("overflow");
+            }
+            n += i / outPlusOne;
+            i %= outPlusOne;
+            if (n > 0x10FFFF || (n >= 0xD800 && n <= 0xDFFF)) {
+                throw new PunycodeException("decoded code point out of range");
+            }
+            if (outLen >= codePoints.length) {
+                throw new PunycodeException("output longer than input");
+            }
+            System.arraycopy(codePoints, i, codePoints, i + 1, outLen - i);
+            codePoints[i] = n;
+            outLen++;
+            i++;
+        }
+        return new String(codePoints, 0, outLen);
     }
 
     /**
@@ -113,7 +193,12 @@ public final class Punycode {
      * @throws PunycodeException 存在空标签
      */
     public static String encodeIdna(String domain) {
-        throw new UnsupportedOperationException("not implemented");
+        return mapLabels(domain, label -> {
+            if (isAscii(label)) {
+                return label;
+            }
+            return ACE_PREFIX + encode(label);
+        });
     }
 
     /**
@@ -124,7 +209,75 @@ public final class Punycode {
      * @throws PunycodeException 存在空标签，或非 {@code xn--} 标签里出现非 ASCII 字符
      */
     public static String decodeIdna(String domain) {
-        throw new UnsupportedOperationException("not implemented");
+        return mapLabels(domain, label -> {
+            boolean hasAcePrefix = label.length() >= ACE_PREFIX.length()
+                    && asciiRegionEqualsIgnoreCase(label, 0, ACE_PREFIX);
+            if (hasAcePrefix) {
+                return decode(asciiToLower(label.substring(ACE_PREFIX.length())));
+            }
+            if (!isAscii(label)) {
+                throw new PunycodeException("non-ASCII label without ACE prefix");
+            }
+            return label;
+        });
+    }
+
+    private static String mapLabels(String domain, Function<String, String> mapper) {
+        StringBuilder result = new StringBuilder(domain.length());
+        int start = 0;
+        boolean first = true;
+        while (true) {
+            int dot = domain.indexOf('.', start);
+            int end = dot < 0 ? domain.length() : dot;
+            if (end == start) {
+                throw new PunycodeException("empty label");
+            }
+            if (!first) {
+                result.append('.');
+            }
+            result.append(mapper.apply(domain.substring(start, end)));
+            first = false;
+            if (dot < 0) {
+                break;
+            }
+            start = dot + 1;
+        }
+        return result.toString();
+    }
+
+    private static boolean isAscii(String s) {
+        for (int i = 0; i < s.length(); i++) {
+            if (s.charAt(i) >= 0x80) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static boolean asciiRegionEqualsIgnoreCase(String s, int offset, String ascii) {
+        for (int j = 0; j < ascii.length(); j++) {
+            char a = s.charAt(offset + j);
+            char b = ascii.charAt(j);
+            if (a >= 'A' && a <= 'Z') {
+                a = (char) (a - 'A' + 'a');
+            }
+            if (a != b) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static String asciiToLower(String s) {
+        StringBuilder sb = new StringBuilder(s.length());
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c >= 'A' && c <= 'Z') {
+                c = (char) (c - 'A' + 'a');
+            }
+            sb.append(c);
+        }
+        return sb.toString();
     }
 
     private static int adapt(int delta, int numpoints, boolean firsttime) {
@@ -143,6 +296,19 @@ public final class Punycode {
             return (char) ('a' + d);
         }
         return (char) ('0' + (d - 26));
+    }
+
+    private static int decodeDigit(char c) {
+        if (c >= '0' && c <= '9') {
+            return c - '0' + 26;
+        }
+        if (c >= 'a' && c <= 'z') {
+            return c - 'a';
+        }
+        if (c >= 'A' && c <= 'Z') {
+            return c - 'A';
+        }
+        throw new PunycodeException("illegal character in encoded section");
     }
 
     private Punycode() {
